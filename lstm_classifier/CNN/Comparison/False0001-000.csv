@@ -1,0 +1,2 @@
+True News,Count,Percentage,Precision,Recall,F1,Accuracy,Fake News,Count,Percentage,Precision,Recall,F1,Accuracy,Unknow,Count,Percentage
+0.0007,215,2.86%,100.00%,40.72%,57.87%,100.00%,4.5e-06,1234,16.44%,74.64%,100.00%,85.48%,74.64%,不确定,6058,80.70%,--,--,--,--

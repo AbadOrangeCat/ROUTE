@@ -24,7 +24,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 import matplotlib.pyplot as plt
 from tensorflow.keras.models import load_model
 from typing import List, Optional  # <-- added for older Python versions
-
+import re
 # ==========================================================
 # 1. 数据加载与预处理 (Data Loading and Preprocessing)
 # ==========================================================
@@ -34,14 +34,32 @@ need_train = False  # change to True if you want to re‑train from scratch
 # source files -------------------------------------------------------------
 fake_df        = pd.read_csv('../../news/fake.csv',       encoding='utf-8')
 real_df        = pd.read_csv('../../news/true.csv',       encoding='utf-8')
-covid_fake_df  = pd.read_csv('../../covid/fakeNews.csv',  encoding='utf-8')
-covid_real_df  = pd.read_csv('../../covid/trueNews.csv',  encoding='utf-8')
+# covid_fake_df  = pd.read_csv('../../covid/fakeNews.csv',  encoding='utf-8')
+# covid_real_df  = pd.read_csv('../../covid/trueNews.csv',  encoding='utf-8')
+
+covid_fake_df  = pd.read_csv('../../news/fake.csv',  encoding='utf-8')
+covid_real_df  = pd.read_csv('../../news/true.csv',  encoding='utf-8')
+
+url_pat = re.compile(r'https?://\S+|www\.\S+')  # 匹配 http(s):// 或 www.
+
+def strip_urls(series: pd.Series) -> pd.Series:
+    """把一整列文本里的 URL 去掉"""
+    return series.astype(str).str.replace(url_pat, '', regex=True)
+
+# 读完 CSV 立刻批量清洗
+# fake_df['text']        = strip_urls(fake_df['text'])
+# real_df['text']        = strip_urls(real_df['text'])
+# covid_fake_df['text']  = strip_urls(covid_fake_df['text'])
+# covid_real_df['text']  = strip_urls(covid_real_df['text'])
 
 # select politics & medical subsets ---------------------------------------
 politics_fake = fake_df[(fake_df['subject'] == 'politics') & (fake_df['text'].str.len() >= 40)]['text']
 politics_real = real_df[(real_df['subject'] == 'politicsNews') & (real_df['text'].str.len() >= 40)]['text']
-medical_fake  = covid_fake_df[covid_fake_df['Text'].str.len() >= 40]['Text']
-medical_real  = covid_real_df[covid_real_df['Text'].str.len() >= 40]['Text']
+# medical_fake  = covid_fake_df[covid_fake_df['Text'].str.len() >= 40]['Text']
+# medical_real  = covid_real_df[covid_real_df['Text'].str.len() >= 40]['Text']
+
+medical_fake  = covid_fake_df[(covid_fake_df['subject'] == 'News') & (covid_fake_df['text'].str.len() >= 40)]['text']
+medical_real  = covid_real_df[(covid_real_df['subject'] == 'worldnews') & (covid_real_df['text'].str.len() >= 40)]['text']
 
 policy_texts  = pd.concat([politics_fake, politics_real]).reset_index(drop=True)
 policy_labels = np.concatenate([np.zeros(len(politics_fake), dtype=int),

@@ -2,25 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-DUPL V2 (Stabilized):
-- Fixes prior collapse (pi_t -> [1,0]) by:
-  (1) clipping pi_t into [pi_clip_min, pi_clip_max]
-  (2) mixing pi_t with source prior pi_source (pi_mix)
-- Adds pseudo-label warmup + alpha_pl ramp
-- Adds class-balanced fallback pseudo selection
-- Lowers default lambda_da
+DUPL V5 (Accuracy-oriented + anti-collapse):
+- Non-LLM UDA baseline for PubHealth (source) -> COVID (target)
+- Fixes target prediction bias via:
+  (1) Distribution Alignment (DA) on teacher predictions (EMA of mean probs)
+  (2) Prior Regularization on student target predictions
+  (3) Inference: match-prior thresholding (unsupervised calibration)
 
-Source (PubHealth):
-  input = claim + main_text
-  label: 0=true, 1=false
-Target (COVID):
-  input = Text
-  training does NOT use target labels
-  evaluation label: prefer label columns (Binary Label/Label), else fallback by file membership:
-    trueNews=1, fakeNews=0
-
-Output:
-  covid_predictions_dupl_v2.csv + console accuracy/report if eval labels available
+Source labels (PubHealth): 0=true, 1=false
+COVID eval labels: 1=true, 0=false
+Target labels NEVER used in training; only for evaluation at the end.
 """
 
 from __future__ import annotations
@@ -46,15 +37,15 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.utils.data import DataLoader, Dataset
-except Exception as e:  # pragma: no cover
+except Exception as e:
     raise RuntimeError(
-        "Failed to import PyTorch. Please install a working PyTorch build (CPU-only is fine).\n"
+        "Failed to import PyTorch. Please install a working PyTorch build.\n"
         f"Original error: {e}"
     )
 
 try:
     from tqdm import tqdm
-except Exception:  # pragma: no cover
+except Exception:
     tqdm = lambda x, **kwargs: x
 
 
@@ -74,7 +65,6 @@ TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|\d+|[^\w\s]")
 
 
 def tokenize(text: str) -> List[str]:
-    """Simple tokenizer (non-LLM)."""
     if text is None:
         return []
     text = str(text).lower()
@@ -98,8 +88,7 @@ class Vocab:
     unk_id: int
 
     def encode(self, tokens: Sequence[str]) -> List[int]:
-        unk = self.unk_id
-        return [self.stoi.get(t, unk) for t in tokens]
+        return [self.stoi.get(t, self.unk_id) for t in tokens]
 
 
 def build_vocab(texts: Sequence[str], min_freq: int = 2, max_size: int = 50000) -> Vocab:
@@ -217,7 +206,6 @@ class TargetUnlabeledDataset(Dataset):
         self.vocab = vocab
         self.max_len = max_len
         self.rng = random.Random(seed)
-
         self.texts: List[str] = [str(t) for t in texts]
         self.encoded: List[List[int]] = []
         for t in self.texts:
@@ -262,7 +250,6 @@ class PseudoLabeledDataset(Dataset):
         self.vocab = vocab
         self.max_len = max_len
         self.rng = random.Random(seed)
-
         assert len(self.indices) == len(self.soft_labels) == len(self.weights)
 
     def __len__(self) -> int:
@@ -311,7 +298,7 @@ def collate_infer(batch, pad_id: int, max_len: int):
     return input_ids, mask, idxs_t
 
 
-# ----------------------------- Model -----------------------------------------
+# ----------------------------- Model (BiGRU + Attn) --------------------------
 
 
 class GradReverse(torch.autograd.Function):
@@ -329,33 +316,40 @@ def grl(x: torch.Tensor, lambda_: float) -> torch.Tensor:
     return GradReverse.apply(x, lambda_)
 
 
-class TextEncoder(nn.Module):
+class AttnPool(nn.Module):
+    def __init__(self, dim: int, dropout: float):
+        super().__init__()
+        self.proj = nn.Linear(dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        scores = self.proj(self.dropout(h)).squeeze(-1)  # (B,L)
+        scores = scores.masked_fill(mask <= 0, -1e9)
+        attn = torch.softmax(scores, dim=-1)  # (B,L)
+        pooled = torch.bmm(attn.unsqueeze(1), h).squeeze(1)  # (B,D)
+        return pooled
+
+
+class TextEncoderAttn(nn.Module):
     def __init__(self, vocab_size: int, emb_dim: int, hidden_size: int, pad_id: int, dropout: float):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_id)
         self.dropout = nn.Dropout(dropout)
-        self.gru = nn.GRU(
-            input_size=emb_dim,
-            hidden_size=hidden_size,
-            batch_first=True,
-            bidirectional=True,
-        )
+        self.gru = nn.GRU(emb_dim, hidden_size, batch_first=True, bidirectional=True)
         self.out_dim = hidden_size * 2
+        self.attn = AttnPool(self.out_dim, dropout=dropout)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(input_ids)
-        x = self.dropout(x)
-        out, _ = self.gru(x)
-
-        mask = attention_mask.unsqueeze(-1)
-        out = out * mask
-        pooled = out.sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        x = self.dropout(self.embedding(input_ids))
+        h, _ = self.gru(x)  # (B,L,2H)
+        h = self.dropout(h)
+        pooled = self.attn(h, attention_mask)
         pooled = self.dropout(pooled)
         return pooled
 
 
 class EncoderClassifier(nn.Module):
-    def __init__(self, encoder: TextEncoder, num_classes: int = 2):
+    def __init__(self, encoder: TextEncoderAttn, num_classes: int = 2):
         super().__init__()
         self.encoder = encoder
         self.classifier = nn.Linear(encoder.out_dim, num_classes)
@@ -396,7 +390,12 @@ def ema_update(teacher: EncoderClassifier, student: EncoderClassifier, decay: fl
         t_param.data.mul_(decay).add_(s_param.data, alpha=1.0 - decay)
 
 
-# ----------------------------- Pseudo label utilities ------------------------
+# ----------------------------- DA / Prior utils ------------------------------
+
+
+def dann_grl_lambda(progress: float) -> float:
+    p = float(np.clip(progress, 0.0, 1.0))
+    return float(2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0)
 
 
 def entropy_norm(probs: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -405,226 +404,203 @@ def entropy_norm(probs: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return ent / math.log(C)
 
 
-def estimate_target_prior_em(
-    p_source_post: np.ndarray,  # (N,C)
-    pi_source: np.ndarray,      # (C,)
-    max_iter: int = 100,
-    tol: float = 1e-6,
-    eps: float = 1e-12,
-) -> np.ndarray:
+def distribution_align_np(probs: np.ndarray, p_ema: np.ndarray, pi_target: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    p = probs / (p_ema[None, :] + eps) * pi_target[None, :]
+    p = p / (p.sum(axis=1, keepdims=True) + eps)
+    return p.astype(np.float32)
+
+
+def distribution_align_torch(probs: torch.Tensor, p_ema: torch.Tensor, pi_target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    p = probs / (p_ema.unsqueeze(0) + eps) * pi_target.unsqueeze(0)
+    p = p / (p.sum(dim=1, keepdim=True) + eps)
+    return p
+
+
+def prior_reg_loss(student_probs: torch.Tensor, pi_target: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
-    Saerens et al. EM prior estimation under label shift:
-      p_t(y|x) ∝ p_s(y|x) * (pi_t(y)/pi_s(y))
-      pi_t = E_x[p_t(y|x)]
+    KL( mean(student_probs) || pi_target )
     """
-    pi_s = np.asarray(pi_source, dtype=np.float64)
-    pi_s = pi_s / (pi_s.sum() + eps)
-    q = pi_s.copy()
-
-    for _ in range(max_iter):
-        ratio = (q + eps) / (pi_s + eps)
-        p_adj = p_source_post * ratio[None, :]
-        p_adj = p_adj / (p_adj.sum(axis=1, keepdims=True) + eps)
-        q_new = p_adj.mean(axis=0)
-        if np.max(np.abs(q_new - q)) < tol:
-            q = q_new
-            break
-        q = q_new
-
-    q = q / (q.sum() + eps)
-    return q.astype(np.float32)
+    m = student_probs.mean(dim=0).clamp_min(eps)
+    m = m / m.sum()
+    return F.kl_div(torch.log(m), pi_target, reduction="sum")
 
 
-def prior_correct(p: np.ndarray, pi_source: np.ndarray, pi_target: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    w = (pi_target + eps) / (pi_source + eps)
-    p_adj = p * w[None, :]
-    p_adj = p_adj / (p_adj.sum(axis=1, keepdims=True) + eps)
-    return p_adj.astype(np.float32)
+# ----------------------------- Pseudo-label pool -----------------------------
 
 
-def stabilize_prior(
-    pi_t_raw: np.ndarray,
-    pi_source: np.ndarray,
-    clip_min: float,
-    clip_max: float,
-    mix: float,
-) -> np.ndarray:
-    pi = np.asarray(pi_t_raw, dtype=np.float32)
-
-    # clip
-    if clip_min is not None and clip_max is not None:
-        pi = np.clip(pi, clip_min, clip_max)
-
-    # normalize
-    pi = pi / (pi.sum() + 1e-12)
-
-    # mix with source prior
-    if mix > 0:
-        pi = (1.0 - mix) * pi + mix * np.asarray(pi_source, dtype=np.float32)
-        pi = pi / (pi.sum() + 1e-12)
-
-    return pi.astype(np.float32)
-
-
-def build_pseudo_label_pool(
+@torch.no_grad()
+def build_pseudo_pool(
     teacher: EncoderClassifier,
     target_loader: DataLoader,
     device: torch.device,
-    pi_source: np.ndarray,
-    n_clusters: int,
-    top_m: int,
-    tau_conf: float,
-    tau_ent: float,
-    min_pseudo: int,
-    min_pseudo_per_class: int,
-    pi_clip_min: float,
-    pi_clip_max: float,
-    pi_mix: float,
-    disable_prior_correction: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    p_ema: np.ndarray,
+    pi_target: np.ndarray,
+    uda_epoch: int,
+    args: argparse.Namespace,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns:
-      sel_indices: (M,)
-      sel_soft_labels: (M,C)
-      sel_weights: (M,)
-      pi_t_used: (C,)
-      pi_t_raw: (C,)
+      sel_indices, sel_soft, sel_w, new_p_ema
     """
     teacher.eval()
-    feats_all: List[np.ndarray] = []
-    probs_all: List[np.ndarray] = []
-    idx_all: List[np.ndarray] = []
+    feats_all, probs_all, idx_all = [], [], []
 
-    with torch.no_grad():
-        for weak_ids, weak_mask, _strong_ids, _strong_mask, idxs in tqdm(
-            target_loader, desc="Teacher forward (target)", leave=False
-        ):
-            weak_ids = weak_ids.to(device)
-            weak_mask = weak_mask.to(device)
-            feats, logits = teacher(weak_ids, weak_mask)
-            probs = torch.softmax(logits, dim=-1)
+    for weak_ids, weak_mask, _strong_ids, _strong_mask, idxs in tqdm(target_loader, desc="Teacher forward (target)", leave=False):
+        weak_ids = weak_ids.to(device)
+        weak_mask = weak_mask.to(device)
+        feats, logits = teacher(weak_ids, weak_mask)
 
-            feats_all.append(feats.cpu().numpy())
-            probs_all.append(probs.cpu().numpy())
-            idx_all.append(idxs.numpy())
+        T = float(args.teacher_temp)
+        probs = torch.softmax(logits / max(1e-6, T), dim=-1)
+
+        feats_all.append(feats.cpu().numpy())
+        probs_all.append(probs.cpu().numpy())
+        idx_all.append(idxs.numpy())
 
     feats = np.concatenate(feats_all, axis=0)
     probs = np.concatenate(probs_all, axis=0)
     idxs = np.concatenate(idx_all, axis=0)
 
     order = np.argsort(idxs)
-    feats = feats[order]
-    probs = probs[order]
-    idxs = idxs[order]
+    feats, probs, idxs = feats[order], probs[order], idxs[order]
 
-    # EM prior estimation (raw)
-    pi_t_raw = estimate_target_prior_em(probs, pi_source)
+    # Update EMA of mean probs
+    p_mean = probs.mean(axis=0).astype(np.float32)
+    p_mean = p_mean / (p_mean.sum() + 1e-12)
+    new_p_ema = args.da_momentum * p_ema + (1.0 - args.da_momentum) * p_mean
+    new_p_ema = new_p_ema / (new_p_ema.sum() + 1e-12)
 
-    # Stabilized prior used for correction
-    pi_t_used = stabilize_prior(pi_t_raw, pi_source, pi_clip_min, pi_clip_max, pi_mix)
-
-    # Prior correction
-    if disable_prior_correction:
-        probs_adj = probs.astype(np.float32)
+    # Apply distribution alignment for selection
+    if args.use_da:
+        probs_adj = distribution_align_np(probs, new_p_ema, pi_target)
     else:
-        probs_adj = prior_correct(probs, pi_source=pi_source, pi_target=pi_t_used)
+        probs_adj = probs.astype(np.float32)
 
     conf = probs_adj.max(axis=1)
     ent = entropy_norm(probs_adj)
-    pred = probs_adj.argmax(axis=1)  # source label space: 0/1
+    pred = probs_adj.argmax(axis=1)
+    score = conf * (1.0 - ent)
+
+    # ramp k_per_class
+    if uda_epoch <= args.pl_warmup_epochs:
+        k_eff = 0
+    else:
+        t = min(1.0, (uda_epoch - args.pl_warmup_epochs) / max(1.0, float(args.k_ramp_epochs)))
+        k_eff = int(max(args.k_min_per_class, round(args.k_per_class * t)))
+
+    if k_eff <= 0:
+        return np.empty((0,), dtype=np.int64), np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32), new_p_ema
 
     # clustering for diversity
     N = feats.shape[0]
-    k = int(min(max(2, n_clusters), N))
-    top_m_eff = int(max(1, top_m))
-    kmeans = MiniBatchKMeans(n_clusters=k, random_state=0, batch_size=2048, n_init=10)
+    k = int(min(max(2, args.n_clusters), N))
+    kmeans = MiniBatchKMeans(n_clusters=k, random_state=args.seed, batch_size=2048, n_init=10)
     cluster_ids = kmeans.fit_predict(feats)
 
-    keep = (conf >= tau_conf) & (ent <= tau_ent)
+    selected: set[int] = set()
 
-    # strict diversity selection: per cluster per class top-m
-    selected = set()
-    if keep.any():
-        for c in range(k):
-            for y in (0, 1):
-                cand = np.where(keep & (cluster_ids == c) & (pred == y))[0]
-                if cand.size == 0:
-                    continue
-                cand_sorted = cand[np.argsort(-conf[cand])]
-                for ii in cand_sorted[:top_m_eff]:
-                    selected.add(int(ii))
+    def pick_for_class(y: int) -> List[int]:
+        need = k_eff
+        picked, picked_set = [], set()
+        conf_thr, ent_thr = float(args.tau_conf), float(args.tau_ent)
 
-    # class-balanced fallback selection (avoid collapse)
-    # looser thresholds
-    looser_conf = max(0.80, tau_conf - 0.10)
-    looser_ent = min(0.55, tau_ent + 0.15)
-    looser = (conf >= looser_conf) & (ent <= looser_ent)
-
-    def count_class(sel_set: set, y: int) -> int:
-        if not sel_set:
-            return 0
-        arr = np.fromiter(sel_set, dtype=np.int64)
-        return int(np.sum(pred[arr] == y))
-
-    # ensure min per class if possible
-    for y in (0, 1):
-        need = max(0, min_pseudo_per_class - count_class(selected, y))
-        if need <= 0:
-            continue
-        cand = np.where(looser & (pred == y))[0]
-        if cand.size == 0:
-            continue
-        cand_sorted = cand[np.argsort(-conf[cand])]
-        for ii in cand_sorted:
-            if ii not in selected:
-                selected.add(int(ii))
-                need -= 1
-                if need <= 0:
-                    break
-
-    # ensure overall minimum
-    if len(selected) < min_pseudo:
-        need = min_pseudo - len(selected)
-        cand = np.where(looser)[0]
-        if cand.size > 0:
-            cand_sorted = cand[np.argsort(-conf[cand])]
-            for ii in cand_sorted:
-                if ii not in selected:
-                    selected.add(int(ii))
-                    need -= 1
+        for _step in range(int(args.relax_steps) + 1):
+            cand = np.where((pred == y) & (conf >= conf_thr) & (ent <= ent_thr))[0]
+            if cand.size > 0:
+                # per-cluster top-m
+                for c in range(k):
                     if need <= 0:
                         break
+                    cand_c = cand[cluster_ids[cand] == c]
+                    if cand_c.size == 0:
+                        continue
+                    cand_sorted = cand_c[np.argsort(-score[cand_c])]
+                    for ii in cand_sorted[: int(args.top_m_per_cluster)]:
+                        if need <= 0:
+                            break
+                        ii = int(ii)
+                        if ii in selected or ii in picked_set:
+                            continue
+                        picked.append(ii)
+                        picked_set.add(ii)
+                        need -= 1
+
+                # fill remaining by global score
+                if need > 0:
+                    cand_sorted = cand[np.argsort(-score[cand])]
+                    for ii in cand_sorted:
+                        if need <= 0:
+                            break
+                        ii = int(ii)
+                        if ii in selected or ii in picked_set:
+                            continue
+                        picked.append(ii)
+                        picked_set.add(ii)
+                        need -= 1
+
+            if need <= 0:
+                break
+
+            # relax thresholds
+            conf_thr = max(float(args.conf_floor), conf_thr - float(args.conf_step))
+            ent_thr = min(float(args.ent_ceiling), ent_thr + float(args.ent_step))
+
+        return picked
+
+    for ii in pick_for_class(0):
+        selected.add(ii)
+    for ii in pick_for_class(1):
+        selected.add(ii)
 
     if len(selected) == 0:
-        return (
-            np.empty((0,), dtype=np.int64),
-            np.empty((0, 2), dtype=np.float32),
-            np.empty((0,), dtype=np.float32),
-            pi_t_used,
-            pi_t_raw,
+        return np.empty((0,), dtype=np.int64), np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32), new_p_ema
+
+    sel_local = np.array(sorted(selected), dtype=np.int64)
+    sel_soft = probs_adj[sel_local].astype(np.float32)
+
+    # weights from score + class-balance reweight
+    sel_score = score[sel_local].astype(np.float32)
+    smin, smax = float(sel_score.min()), float(sel_score.max())
+    if smax - smin < 1e-6:
+        w = np.ones_like(sel_score, dtype=np.float32)
+    else:
+        w = (sel_score - smin) / (smax - smin + 1e-6)
+        w = 0.2 + 0.8 * w
+
+    hard = sel_soft.argmax(axis=1)
+    counts = np.bincount(hard, minlength=2).astype(np.float32) + 1e-6
+    inv = counts.sum() / counts
+    inv = inv / inv.mean()
+    w = w * inv[hard]
+    w = w.astype(np.float32)
+
+    sel_indices = idxs[sel_local].astype(np.int64)
+
+    if args.print_pseudo_stats:
+        dist = np.bincount(hard, minlength=2).tolist()
+        print(
+            f"[Pseudo][E{uda_epoch}] k_eff={k_eff} selected={len(sel_indices)} "
+            f"dist(source 0/1 true/false)={dist} "
+            f"p_ema=[{new_p_ema[0]:.2f},{new_p_ema[1]:.2f}] pi_tgt=[{pi_target[0]:.2f},{pi_target[1]:.2f}]"
         )
 
-    selected_local = np.array(sorted(selected), dtype=np.int64)
-
-    sel_soft = probs_adj[selected_local].astype(np.float32)
-
-    sel_conf = conf[selected_local].astype(np.float32)
-    sel_ent = ent[selected_local].astype(np.float32)
-
-    # weights: positive, do not depend on tau_conf (so looser-selected samples still contribute)
-    sel_w = np.clip(sel_conf, 0.0, 1.0) * (1.0 - np.clip(sel_ent, 0.0, 1.0))
-    sel_w = sel_w.astype(np.float32)
-
-    sel_indices = idxs[selected_local].astype(np.int64)
-    return sel_indices, sel_soft, sel_w, pi_t_used, pi_t_raw
+    return sel_indices, sel_soft, w, new_p_ema
 
 
 # ----------------------------- Training --------------------------------------
 
 
-def dann_grl_lambda(progress: float) -> float:
-    p = float(np.clip(progress, 0.0, 1.0))
-    return float(2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0)
+@torch.no_grad()
+def eval_source(model: EncoderClassifier, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct, total = 0, 0
+    for ids, mask, y in loader:
+        ids, mask, y = ids.to(device), mask.to(device), y.to(device)
+        _f, logits = model(ids, mask)
+        pred = logits.argmax(dim=-1)
+        correct += int((pred == y).sum().item())
+        total += int(y.numel())
+    return float(correct / max(1, total))
 
 
 def alpha_ramp(epoch: int, warmup: int, ramp: int, target_alpha: float) -> float:
@@ -636,25 +612,49 @@ def alpha_ramp(epoch: int, warmup: int, ramp: int, target_alpha: float) -> float
     return float(target_alpha * t)
 
 
-def train(
-    source_texts: Sequence[str],
-    source_labels: Sequence[int],
-    target_texts: Sequence[str],
+def get_pi_target(mode: str, pi_source: np.ndarray) -> np.ndarray:
+    mode = mode.lower().strip()
+    if mode == "uniform":
+        return np.array([0.5, 0.5], dtype=np.float32)
+    if mode == "source":
+        return np.asarray(pi_source, dtype=np.float32)
+    # fallback
+    return np.array([0.5, 0.5], dtype=np.float32)
+
+
+def train_v5(
+    src_train_texts: Sequence[str],
+    src_train_y: Sequence[int],
+    src_val_texts: Optional[Sequence[str]],
+    src_val_y: Optional[Sequence[int]],
+    tgt_texts: Sequence[str],
     args: argparse.Namespace,
-) -> Tuple[EncoderClassifier, Vocab, np.ndarray]:
-    vocab = build_vocab(list(source_texts) + list(target_texts), min_freq=args.min_freq, max_size=args.vocab_size)
+) -> Tuple[EncoderClassifier, Vocab, np.ndarray, np.ndarray]:
+    vocab = build_vocab(list(src_train_texts) + list(tgt_texts), min_freq=args.min_freq, max_size=args.vocab_size)
 
-    src_ds = SourceLabeledDataset(source_texts, source_labels, vocab=vocab, max_len=args.max_len)
-    tgt_ds = TargetUnlabeledDataset(target_texts, vocab=vocab, max_len=args.max_len, seed=args.seed + 7)
-
-    src_loader = DataLoader(
-        src_ds,
+    src_train_ds = SourceLabeledDataset(src_train_texts, src_train_y, vocab=vocab, max_len=args.max_len)
+    src_train_loader = DataLoader(
+        src_train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=partial(collate_source, pad_id=vocab.pad_id, max_len=args.max_len),
         drop_last=False,
     )
+
+    src_val_loader = None
+    if src_val_texts is not None and src_val_y is not None and len(src_val_texts) > 0:
+        src_val_ds = SourceLabeledDataset(src_val_texts, src_val_y, vocab=vocab, max_len=args.max_len)
+        src_val_loader = DataLoader(
+            src_val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=partial(collate_source, pad_id=vocab.pad_id, max_len=args.max_len),
+            drop_last=False,
+        )
+
+    tgt_ds = TargetUnlabeledDataset(tgt_texts, vocab=vocab, max_len=args.max_len, seed=args.seed + 7)
     tgt_loader = DataLoader(
         tgt_ds,
         batch_size=args.batch_size,
@@ -674,7 +674,7 @@ def train(
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
-    encoder = TextEncoder(
+    encoder = TextEncoderAttn(
         vocab_size=len(vocab.itos),
         emb_dim=args.emb_dim,
         hidden_size=args.hidden_size,
@@ -688,75 +688,73 @@ def train(
     for p in teacher.parameters():
         p.requires_grad = False
 
-    labels_np = np.asarray(source_labels, dtype=np.int64)
+    labels_np = np.asarray(src_train_y, dtype=np.int64)
     pi_source = np.array([np.mean(labels_np == 0), np.mean(labels_np == 1)], dtype=np.float32)
     pi_source = pi_source / (pi_source.sum() + 1e-12)
 
+    pi_target = get_pi_target(args.target_prior_mode, pi_source)
+    pi_target_t = torch.tensor(pi_target, dtype=torch.float32, device=device)
+
+    # DA running mean init
+    p_ema = np.array([0.5, 0.5], dtype=np.float32) if args.da_init_uniform else pi_source.copy()
+    p_ema = p_ema / (p_ema.sum() + 1e-12)
+
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    # ---------------- A) Source pretrain ----------------
+    best_val = -1.0
+    best_state = None
+
+    for ep in range(1, args.pretrain_epochs + 1):
+        student.train()
+        pbar = tqdm(src_train_loader, desc=f"Pretrain {ep}/{args.pretrain_epochs}", leave=True)
+        for ids, mask, y in pbar:
+            ids, mask, y = ids.to(device), mask.to(device), y.to(device)
+            _f, logits = student(ids, mask)
+            loss = F.cross_entropy(logits, y)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(student.parameters(), max_norm=args.grad_clip)
+            optimizer.step()
+
+            ema_update(teacher, student.backbone, decay=args.ema_decay)
+            pbar.set_postfix(sup=float(loss.detach().cpu()))
+
+        if src_val_loader is not None:
+            val_acc = eval_source(teacher, src_val_loader, device)
+            print(f"[Pretrain] val_acc={val_acc:.4f}")
+            if val_acc > best_val:
+                best_val = val_acc
+                best_state = copy.deepcopy(teacher.state_dict())
+
+    if best_state is not None:
+        teacher.load_state_dict(best_state)
+        student.backbone.load_state_dict(best_state)
+
+    # ---------------- B) UDA stage ----------------
+    steps_per_epoch = max(1, max(len(src_train_loader), len(tgt_loader)))
+    total_steps = args.uda_epochs * steps_per_epoch
     global_step = 0
-    steps_per_epoch = max(1, max(len(src_loader), len(tgt_loader)))
-    total_steps = args.epochs * steps_per_epoch
 
-    last_pi_target = np.array([0.5, 0.5], dtype=np.float32)
+    for uda_ep in range(1, args.uda_epochs + 1):
+        alpha_pl_eff = alpha_ramp(uda_ep, args.pl_warmup_epochs, args.pl_ramp_epochs, args.alpha_pl)
 
-    for epoch in range(1, args.epochs + 1):
-        # confidence threshold schedule
-        tau_conf = max(
-            args.tau_conf_end,
-            args.tau_conf_start - (epoch - 1) * (args.tau_conf_start - args.tau_conf_end) / max(1, args.epochs - 1),
+        da_ramp = min(1.0, uda_ep / max(1.0, float(args.da_ramp_epochs)))
+        lambda_da_eff = float(args.lambda_da) * da_ramp
+
+        # build pseudo pool once per epoch (and update p_ema)
+        sel_indices, sel_soft, sel_w, p_ema = build_pseudo_pool(
+            teacher=teacher,
+            target_loader=tgt_eval_loader,
+            device=device,
+            p_ema=p_ema,
+            pi_target=pi_target,
+            uda_epoch=uda_ep,
+            args=args,
         )
 
-        alpha_pl_eff = alpha_ramp(epoch, args.pl_warmup_epochs, args.pl_ramp_epochs, args.alpha_pl)
-
-        # Build pseudo pool only after warmup (saves time + avoids early collapse)
-        sel_indices = np.empty((0,), dtype=np.int64)
-        sel_soft = np.empty((0, 2), dtype=np.float32)
-        sel_w = np.empty((0,), dtype=np.float32)
-        pi_t_used = last_pi_target
-        pi_t_raw = last_pi_target
-
-        if epoch > args.pl_warmup_epochs:
-            min_per_class = args.min_pseudo_per_class
-            if min_per_class <= 0:
-                min_per_class = max(50, args.min_pseudo // 2)
-
-            sel_indices, sel_soft, sel_w, pi_t_used, pi_t_raw = build_pseudo_label_pool(
-                teacher=teacher,
-                target_loader=tgt_eval_loader,
-                device=device,
-                pi_source=pi_source,
-                n_clusters=args.n_clusters,
-                top_m=args.top_m_per_cluster,
-                tau_conf=tau_conf,
-                tau_ent=args.tau_ent,
-                min_pseudo=args.min_pseudo,
-                min_pseudo_per_class=min_per_class,
-                pi_clip_min=args.pi_clip_min,
-                pi_clip_max=args.pi_clip_max,
-                pi_mix=args.pi_mix,
-                disable_prior_correction=args.disable_prior_correction,
-            )
-            last_pi_target = pi_t_used
-
-            # Print pseudo stats once per epoch
-            if args.print_pseudo_stats:
-                if sel_indices.size > 0:
-                    pseudo_hard = sel_soft.argmax(axis=1)
-                    counts = np.bincount(pseudo_hard, minlength=2).tolist()
-                else:
-                    counts = [0, 0]
-                print(
-                    f"[Pseudo][E{epoch}] pi_raw=[{pi_t_raw[0]:.2f},{pi_t_raw[1]:.2f}] "
-                    f"pi_used=[{pi_t_used[0]:.2f},{pi_t_used[1]:.2f}] "
-                    f"pseudo_dist(true/false in source space 0/1)={counts} "
-                    f"alpha_pl_eff={alpha_pl_eff:.3f}"
-                )
-        else:
-            if args.print_pseudo_stats:
-                print(f"[Pseudo][E{epoch}] warmup (no pseudo). alpha_pl_eff={alpha_pl_eff:.3f}")
-
-        pseudo_loader: Optional[DataLoader]
+        pseudo_loader = None
         if sel_indices.size > 0:
             pseudo_ds = PseudoLabeledDataset(
                 base_encoded=tgt_ds.encoded,
@@ -765,7 +763,7 @@ def train(
                 weights=sel_w,
                 vocab=vocab,
                 max_len=args.max_len,
-                seed=args.seed + 17 + epoch,
+                seed=args.seed + 100 + uda_ep,
             )
             pseudo_loader = DataLoader(
                 pseudo_ds,
@@ -775,40 +773,34 @@ def train(
                 collate_fn=partial(collate_pseudo, pad_id=vocab.pad_id, max_len=args.max_len),
                 drop_last=False,
             )
-        else:
-            pseudo_loader = None
+        pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
+
+        # cache p_ema / pi_target on torch
+        p_ema_t = torch.tensor(p_ema, dtype=torch.float32, device=device)
 
         student.train()
         teacher.eval()
 
-        src_iter = iter(src_loader)
+        src_iter = iter(src_train_loader)
         tgt_iter = iter(tgt_loader)
-        pseudo_iter = iter(pseudo_loader) if pseudo_loader is not None else None
 
-        pbar = tqdm(range(steps_per_epoch), desc=f"Epoch {epoch}/{args.epochs}", leave=True)
-
+        pbar = tqdm(range(steps_per_epoch), desc=f"UDA {uda_ep}/{args.uda_epochs}", leave=True)
         for _ in pbar:
-            # fetch batches
             try:
                 src_ids, src_mask, src_y = next(src_iter)
             except StopIteration:
-                src_iter = iter(src_loader)
+                src_iter = iter(src_train_loader)
                 src_ids, src_mask, src_y = next(src_iter)
 
             try:
-                tgt_w_ids, tgt_w_mask, tgt_s_ids, tgt_s_mask, _tgt_idx = next(tgt_iter)
+                tgt_w_ids, tgt_w_mask, tgt_s_ids, tgt_s_mask, _ = next(tgt_iter)
             except StopIteration:
                 tgt_iter = iter(tgt_loader)
-                tgt_w_ids, tgt_w_mask, tgt_s_ids, tgt_s_mask, _tgt_idx = next(tgt_iter)
+                tgt_w_ids, tgt_w_mask, tgt_s_ids, tgt_s_mask, _ = next(tgt_iter)
 
-            src_ids = src_ids.to(device)
-            src_mask = src_mask.to(device)
-            src_y = src_y.to(device)
-
-            tgt_w_ids = tgt_w_ids.to(device)
-            tgt_w_mask = tgt_w_mask.to(device)
-            tgt_s_ids = tgt_s_ids.to(device)
-            tgt_s_mask = tgt_s_mask.to(device)
+            src_ids, src_mask, src_y = src_ids.to(device), src_mask.to(device), src_y.to(device)
+            tgt_w_ids, tgt_w_mask = tgt_w_ids.to(device), tgt_w_mask.to(device)
+            tgt_s_ids, tgt_s_mask = tgt_s_ids.to(device), tgt_s_mask.to(device)
 
             # source supervised
             src_feats, src_logits = student(src_ids, src_mask)
@@ -816,11 +808,16 @@ def train(
 
             # target student strong
             tgt_feats, tgt_logits_s = student(tgt_s_ids, tgt_s_mask)
+            tgt_probs_s = torch.softmax(tgt_logits_s, dim=-1)
 
-            # target teacher weak
+            # teacher weak
             with torch.no_grad():
-                _tgt_feats_w, tgt_logits_w = teacher(tgt_w_ids, tgt_w_mask)
-                tgt_probs_w = torch.softmax(tgt_logits_w, dim=-1)
+                _tf, tgt_logits_w = teacher(tgt_w_ids, tgt_w_mask)
+                T = float(args.teacher_temp)
+                tgt_probs_w = torch.softmax(tgt_logits_w / max(1e-6, T), dim=-1)
+
+                if args.use_da:
+                    tgt_probs_w = distribution_align_torch(tgt_probs_w, p_ema_t, pi_target_t)
 
             # consistency
             logp_s = torch.log_softmax(tgt_logits_s, dim=-1)
@@ -833,33 +830,46 @@ def train(
             # domain adversarial
             progress = global_step / max(1, total_steps)
             grl_l = dann_grl_lambda(progress)
+
             dom_src = student.domain_disc(grl(src_feats, grl_l))
             dom_tgt = student.domain_disc(grl(tgt_feats, grl_l))
+
+            # clamp logits to avoid rare huge BCE spikes
+            dom_src = torch.clamp(dom_src, -10.0, 10.0)
+            dom_tgt = torch.clamp(dom_tgt, -10.0, 10.0)
+
             loss_da = 0.5 * (
                 F.binary_cross_entropy_with_logits(dom_src, torch.zeros_like(dom_src))
                 + F.binary_cross_entropy_with_logits(dom_tgt, torch.ones_like(dom_tgt))
             )
 
-            # pseudo label loss
+            # pseudo-label loss
             loss_pl = torch.tensor(0.0, device=device)
-            if (pseudo_iter is not None) and (alpha_pl_eff > 0):
+            if pseudo_iter is not None and alpha_pl_eff > 0:
                 try:
                     pl_ids, pl_mask, pl_soft, pl_w = next(pseudo_iter)
                 except StopIteration:
-                    pseudo_iter = iter(pseudo_loader)  # type: ignore[arg-type]
+                    pseudo_iter = iter(pseudo_loader)  # type: ignore
                     pl_ids, pl_mask, pl_soft, pl_w = next(pseudo_iter)
 
-                pl_ids = pl_ids.to(device)
-                pl_mask = pl_mask.to(device)
-                pl_soft = pl_soft.to(device)
-                pl_w = pl_w.to(device)
+                pl_ids, pl_mask = pl_ids.to(device), pl_mask.to(device)
+                pl_soft, pl_w = pl_soft.to(device), pl_w.to(device)
 
-                _pl_feats, pl_logits = student(pl_ids, pl_mask)
+                _pf, pl_logits = student(pl_ids, pl_mask)
                 logp_pl = torch.log_softmax(pl_logits, dim=-1)
                 kl_pl = F.kl_div(logp_pl, pl_soft, reduction="none").sum(dim=1)
                 loss_pl = (kl_pl * pl_w).mean()
 
-            loss = loss_sup + args.lambda_da * loss_da + alpha_pl_eff * loss_pl + args.beta_con * loss_con
+            # prior regularization (prevents collapse)
+            loss_prior = prior_reg_loss(tgt_probs_s, pi_target_t) if args.gamma_prior > 0 else torch.tensor(0.0, device=device)
+
+            loss = (
+                loss_sup
+                + lambda_da_eff * loss_da
+                + args.beta_con * loss_con
+                + alpha_pl_eff * loss_pl
+                + args.gamma_prior * loss_prior
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -872,15 +882,16 @@ def train(
             pbar.set_postfix(
                 sup=float(loss_sup.detach().cpu()),
                 da=float(loss_da.detach().cpu()),
-                pl=float(loss_pl.detach().cpu()),
                 con=float(loss_con.detach().cpu()),
-                grl=float(grl_l),
+                pl=float(loss_pl.detach().cpu()),
+                prior=float(loss_prior.detach().cpu()),
+                alpha=float(alpha_pl_eff),
+                lambda_da=float(lambda_da_eff),
                 pseudo=int(sel_indices.size),
-                pi_t=f"[{float(last_pi_target[0]):.2f},{float(last_pi_target[1]):.2f}]",
-                alpha_pl=float(alpha_pl_eff),
+                p_ema=f"[{p_ema[0]:.2f},{p_ema[1]:.2f}]",
             )
 
-    return teacher, vocab, last_pi_target
+    return teacher, vocab, pi_target, p_ema
 
 
 # ----------------------------- I/O -------------------------------------------
@@ -903,17 +914,14 @@ def read_pubhealth_csv(path: str) -> Tuple[List[str], List[int]]:
 
     y_num = _coerce_source_label_series_to_int01(df["label"])
     valid = y_num.isin([0, 1])
-
     if not bool(valid.all()):
         invalid_vals = df.loc[~valid, "label"].value_counts(dropna=False).head(10)
-        print(
-            f"[Warn] PubHealth labels not in {{0,1}}. Will drop {int((~valid).sum())} rows. Examples:\n{invalid_vals}"
-        )
+        print(f"[Warn] PubHealth labels not in {{0,1}}. Will drop {int((~valid).sum())} rows. Examples:\n{invalid_vals}")
 
     df = df.loc[valid].copy()
-    y = y_num.loc[valid].astype(int).tolist()
+    labels = y_num.loc[valid].astype(int).tolist()
     texts = (df["claim"].fillna("").astype(str) + " " + df["main_text"].fillna("").astype(str)).tolist()
-    return texts, y
+    return texts, labels
 
 
 def read_covid_csv_text_and_optional_binary_label(path: str) -> Tuple[List[str], Optional[List[int]], Optional[str]]:
@@ -922,7 +930,6 @@ def read_covid_csv_text_and_optional_binary_label(path: str) -> Tuple[List[str],
         raise ValueError(f"{path} missing column 'Text'. Found: {list(df.columns)}")
     texts = df["Text"].fillna("").astype(str).tolist()
 
-    # find label column (case-insensitive)
     col_lower_map = {str(c).strip().lower(): c for c in df.columns}
     candidates = ["binary label", "binary_label", "binarylabel", "label"]
     label_col = None
@@ -936,18 +943,7 @@ def read_covid_csv_text_and_optional_binary_label(path: str) -> Tuple[List[str],
     s = df[label_col]
     if s.dtype == object:
         ss = s.astype(str).str.strip().str.lower()
-        ss = ss.replace(
-            {
-                "true": "1",
-                "false": "0",
-                "real": "1",
-                "fake": "0",
-                "legit": "1",
-                "legitimate": "1",
-                "misleading": "0",
-                "pants on fire": "0",
-            }
-        )
+        ss = ss.replace({"true": "1", "false": "0", "real": "1", "fake": "0"})
         y_num = pd.to_numeric(ss, errors="coerce")
     else:
         y_num = pd.to_numeric(s, errors="coerce")
@@ -958,77 +954,114 @@ def read_covid_csv_text_and_optional_binary_label(path: str) -> Tuple[List[str],
     return texts, y_num.astype(int).tolist(), str(label_col)
 
 
+# ----------------------------- Inference helper ------------------------------
+
+
+def infer_predict_labels(
+    probs_source: np.ndarray,  # (N,2) probs in source label space [true,false]
+    infer_match_prior: bool,
+    pi_target: np.ndarray,      # (2,) in source label space
+) -> np.ndarray:
+    """
+    Convert to COVID label space (1=true, 0=false).
+    If infer_match_prior:
+      choose threshold so that predicted TRUE fraction matches pi_target[source_true]
+    """
+    score_true = probs_source[:, 0].astype(np.float32)  # source true prob -> covid true score
+    if not infer_match_prior:
+        pred_source = probs_source.argmax(axis=1).astype(int)        # 0=true,1=false
+        pred_covid = np.where(pred_source == 0, 1, 0).astype(int)    # 1=true,0=false
+        return pred_covid
+
+    # desired fraction of covid_true is pi_target[source_true]
+    pi_true = float(pi_target[0])
+    pi_true = float(np.clip(pi_true, 0.05, 0.95))
+    thr = float(np.quantile(score_true, 1.0 - pi_true))
+    pred_covid = (score_true >= thr).astype(int)
+    return pred_covid
+
+
 # ----------------------------- Main ------------------------------------------
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-
     base_dir = Path(__file__).resolve().parent
 
-    # Data defaults
     parser.add_argument("--pubhealth_train", type=str, default=str(base_dir / "pubhealth_train_clean.csv"))
     parser.add_argument("--pubhealth_val", type=str, default=str(base_dir / "pubhealth_validation_clean.csv"))
     parser.add_argument("--covid_true", type=str, default=str(base_dir / "../covid/trueNews.csv"))
     parser.add_argument("--covid_fake", type=str, default=str(base_dir / "../covid/fakeNews.csv"))
-    parser.add_argument("--out_csv", type=str, default=str(base_dir / "covid_predictions_dupl_v2.csv"))
+    parser.add_argument("--out_csv", type=str, default=str(base_dir / "covid_predictions_dupl_v5.csv"))
 
-    # Preprocess
     parser.add_argument("--max_len", type=int, default=256)
     parser.add_argument("--vocab_size", type=int, default=50000)
     parser.add_argument("--min_freq", type=int, default=2)
 
-    # Model
     parser.add_argument("--emb_dim", type=int, default=200)
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.2)
 
-    # Train
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--pretrain_epochs", type=int, default=4)
+    parser.add_argument("--uda_epochs", type=int, default=10)
+
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--ema_decay", type=float, default=0.999)
 
-    # Loss weights
-    parser.add_argument("--lambda_da", type=float, default=0.3)  # V2 default lowered
+    parser.add_argument("--lambda_da", type=float, default=0.05)
+    parser.add_argument("--da_ramp_epochs", type=int, default=5)
+
     parser.add_argument("--alpha_pl", type=float, default=1.0)
     parser.add_argument("--beta_con", type=float, default=1.0)
+    parser.add_argument("--gamma_prior", type=float, default=0.2, help="Prior regularization weight (anti-collapse)")
 
-    # Pseudo labeling schedule
-    parser.add_argument("--pl_warmup_epochs", type=int, default=3)
+    parser.add_argument("--pl_warmup_epochs", type=int, default=2)
     parser.add_argument("--pl_ramp_epochs", type=int, default=2)
 
-    # Pseudo labeling thresholds
-    parser.add_argument("--tau_conf_start", type=float, default=0.95)
-    parser.add_argument("--tau_conf_end", type=float, default=0.80)
-    parser.add_argument("--tau_ent", type=float, default=0.35)
+    # pseudo selection
+    parser.add_argument("--tau_conf", type=float, default=0.93)
+    parser.add_argument("--tau_ent", type=float, default=0.60)
+    parser.add_argument("--k_per_class", type=int, default=600)
+    parser.add_argument("--k_min_per_class", type=int, default=150)
+    parser.add_argument("--k_ramp_epochs", type=int, default=4)
 
-    # Pseudo selection diversity + balancing
     parser.add_argument("--n_clusters", type=int, default=50)
-    parser.add_argument("--top_m_per_cluster", type=int, default=20)
-    parser.add_argument("--min_pseudo", type=int, default=500)
-    parser.add_argument("--min_pseudo_per_class", type=int, default=-1, help="<=0 means auto (min_pseudo//2)")
+    parser.add_argument("--top_m_per_cluster", type=int, default=10)
 
-    # Prior stabilization
-    parser.add_argument("--pi_clip_min", type=float, default=0.05)
-    parser.add_argument("--pi_clip_max", type=float, default=0.95)
-    parser.add_argument("--pi_mix", type=float, default=0.2)
-    parser.add_argument("--disable_prior_correction", action="store_true")
+    parser.add_argument("--relax_steps", type=int, default=8)
+    parser.add_argument("--conf_floor", type=float, default=0.55)
+    parser.add_argument("--conf_step", type=float, default=0.05)
+    parser.add_argument("--ent_ceiling", type=float, default=0.95)
+    parser.add_argument("--ent_step", type=float, default=0.05)
 
-    # System
+    # teacher temperature
+    parser.add_argument("--teacher_temp", type=float, default=1.0)
+
+    # distribution alignment
+    parser.add_argument("--use_da", action="store_true", help="Enable distribution alignment (recommended)")
+    parser.add_argument("--da_momentum", type=float, default=0.99)
+    parser.add_argument("--da_init_uniform", action="store_true", help="Init DA EMA with uniform prior")
+
+    # target prior choice for DA / prior reg / inference
+    parser.add_argument("--target_prior_mode", type=str, default="uniform", choices=["uniform", "source"])
+
+    # inference calibration
+    parser.add_argument("--infer_match_prior", action="store_true", help="Match predicted positive rate to prior (recommended)")
+
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_workers", type=int, default=0)  # Windows safe
-    parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--cpu", action="store_true")
 
-    # Evaluation / logs
-    parser.add_argument("--skip_eval", action="store_true", help="Skip evaluation even if labels exist")
-    parser.add_argument("--print_pseudo_stats", action="store_true", help="Print pseudo/prior stats per epoch")
+    parser.add_argument("--skip_eval", action="store_true")
+    parser.add_argument("--print_pseudo_stats", action="store_true")
 
     args = parser.parse_args()
     set_seed(args.seed)
 
+    # files check
     must_exist = [args.pubhealth_train, args.covid_true, args.covid_fake]
     for fp in must_exist:
         if not Path(fp).exists():
@@ -1036,21 +1069,20 @@ def main() -> None:
 
     if args.pubhealth_val and not Path(args.pubhealth_val).exists():
         print(f"[Warn] pubhealth_val not found: {args.pubhealth_val}, will skip.")
-        args.pubhealth_val = None
+        args.pubhealth_val = ""
 
-    # source
+    # read source
     src_train_texts, src_train_y = read_pubhealth_csv(args.pubhealth_train)
+    src_val_texts, src_val_y = ([], [])
     if args.pubhealth_val:
         src_val_texts, src_val_y = read_pubhealth_csv(args.pubhealth_val)
-        source_texts = src_train_texts + src_val_texts
-        source_y = src_train_y + src_val_y
-    else:
-        source_texts, source_y = src_train_texts, src_train_y
 
-    print(f"[Data] Source size: {len(source_texts)}")
-    print(f"[Data] Source label distribution: {pd.Series(source_y).value_counts().to_dict()}")
+    print(f"[Data] Source train size: {len(src_train_texts)}")
+    print(f"[Data] Source train label dist: {pd.Series(src_train_y).value_counts().to_dict()}")
+    if src_val_texts:
+        print(f"[Data] Source val size: {len(src_val_texts)}")
 
-    # target (texts + optional labels)
+    # read target
     true_texts, true_labels_opt, true_lab_col = read_covid_csv_text_and_optional_binary_label(args.covid_true)
     fake_texts, fake_labels_opt, fake_lab_col = read_covid_csv_text_and_optional_binary_label(args.covid_fake)
 
@@ -1078,16 +1110,22 @@ def main() -> None:
 
     print(f"[Data] Target size (rows): {len(eval_texts)}")
     if eval_available and eval_y is not None:
-        print(f"[Data] Evaluation labels source: {eval_src}")
-        print(f"[Data] Target label distribution (eval): {pd.Series(eval_y).value_counts().to_dict()}")
+        print(f"[Data] Eval labels source: {eval_src}")
+        print(f"[Data] Target label dist (eval): {pd.Series(eval_y).value_counts().to_dict()}")
 
-    # training target texts can be dedup
     tgt_texts_train = list(dict.fromkeys(eval_texts))
     print(f"[Data] Target unique texts for training: {len(tgt_texts_train)}")
 
-    teacher, vocab, pi_t = train(source_texts, source_y, tgt_texts_train, args)
+    teacher, vocab, pi_target, p_ema = train_v5(
+        src_train_texts=src_train_texts,
+        src_train_y=src_train_y,
+        src_val_texts=src_val_texts if src_val_texts else None,
+        src_val_y=src_val_y if src_val_y else None,
+        tgt_texts=tgt_texts_train,
+        args=args,
+    )
 
-    # inference on eval_texts (no dedup, keep order)
+    # inference
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     infer_ds = TargetInferenceDataset(eval_texts, vocab=vocab, max_len=args.max_len)
     infer_loader = DataLoader(
@@ -1109,15 +1147,16 @@ def main() -> None:
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             probs_out[idxs.numpy()] = probs
 
-    pred_source_label = probs_out.argmax(axis=1).astype(int)             # source: 0=true,1=false
-    pred_covid_label = np.where(pred_source_label == 0, 1, 0).astype(int)  # covid: 1=true,0=false
+    pred_covid_label = infer_predict_labels(
+        probs_source=probs_out,
+        infer_match_prior=args.infer_match_prior,
+        pi_target=pi_target,
+    )
 
-    # save
     out_dict = {
         "Text": eval_texts,
-        "prob_true": probs_out[:, 0],
-        "prob_false": probs_out[:, 1],
-        "pred_source_label(0=true,1=false)": pred_source_label,
+        "prob_source_true(label0)": probs_out[:, 0],
+        "prob_source_false(label1)": probs_out[:, 1],
         "pred_covid_label(1=true,0=false)": pred_covid_label,
     }
     if eval_available and eval_y is not None:
@@ -1127,13 +1166,9 @@ def main() -> None:
     out_df.to_csv(args.out_csv, index=False, encoding="utf-8-sig")
 
     print(f"[OK] Saved predictions to: {args.out_csv}")
-    print(f"[Info] Last stabilized target prior pi_t (true/false in source space 0/1): {pi_t}")
+    print(f"[Info] pi_target(source true/false)={pi_target}, p_ema_last={p_ema}")
+    print(f"[Info] Predicted COVID label distribution (0/1): {pd.Series(pred_covid_label).value_counts().to_dict()}")
 
-    # predicted distribution (sanity)
-    pred_dist = pd.Series(pred_covid_label).value_counts().to_dict()
-    print(f"[Info] Predicted COVID label distribution (0/1): {pred_dist}")
-
-    # eval
     if eval_available and eval_y is not None:
         acc = accuracy_score(eval_y, pred_covid_label)
         cm = confusion_matrix(eval_y, pred_covid_label, labels=[0, 1])

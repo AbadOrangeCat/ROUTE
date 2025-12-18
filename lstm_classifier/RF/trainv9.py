@@ -1516,8 +1516,8 @@ def main() -> None:
     base_dir = Path(__file__).resolve().parent
 
     # Data (defaults read from script directory)
-    parser.add_argument("--pubhealth_train", type=str, default=str(base_dir / "pubhealth_train_clean.csv"))
-    parser.add_argument("--pubhealth_val", type=str, default=str(base_dir / "pubhealth_validation_clean.csv"))
+    parser.add_argument("--pubhealth_train", type=str, default=str(base_dir / "./pubhealth/pubhealth_train_clean.csv"))
+    parser.add_argument("--pubhealth_val", type=str, default=str(base_dir / "./pubhealth/pubhealth_validation_clean.csv"))
     parser.add_argument("--covid_true", type=str, default=str(base_dir / "../covid/trueNews.csv"))
     parser.add_argument("--covid_fake", type=str, default=str(base_dir / "../covid/fakeNews.csv"))
     parser.add_argument("--out_csv", type=str, default=str(base_dir / "covid_predictions_dupl_v9_1.csv"))

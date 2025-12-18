@@ -33,6 +33,10 @@ V9.1 upgrades:
      MCC,
      SupCon
 
+NEW (added by request):
+  - Before starting UDA training on COVID (target domain), evaluate the source-only teacher
+    on COVID dataset to report pre-UDA accuracy.
+
 Usage (defaults read from script directory):
   python train_v9_1.py --print_pseudo_stats
 
@@ -1110,6 +1114,9 @@ def train_v9_1(
     src_val_y: Optional[Sequence[int]],
     tgt_texts: Sequence[str],
     args: argparse.Namespace,
+    # NEW: pass COVID eval texts/labels to evaluate BEFORE UDA
+    tgt_eval_texts: Optional[Sequence[str]] = None,
+    tgt_eval_y: Optional[np.ndarray] = None,
 ) -> Tuple["EncoderClassifier", Vocab, np.ndarray, np.ndarray, float, np.ndarray]:
     # vocab
     vocab = build_vocab(list(src_train_texts) + list(tgt_texts), min_freq=args.min_freq, max_size=args.vocab_size)
@@ -1281,6 +1288,21 @@ def train_v9_1(
         print(f"[Calib] Fitted temperature T={calib_T:.4f} on source val (bounds {args.temp_min}-{args.temp_max})")
     else:
         print("[Calib] Skipped temperature scaling (no val or disabled)")
+
+    # ============ NEW: Pre-UDA eval on COVID ============
+    if tgt_eval_texts is not None and len(tgt_eval_texts) > 0:
+        evaluate_covid_before_uda(
+            teacher=teacher,
+            vocab=vocab,
+            texts=tgt_eval_texts,
+            y_true=tgt_eval_y,
+            args=args,
+            device=device,
+            calib_T=calib_T,
+            p_ema=p_ema,
+            pi_target=pi_target,
+            stage="Pre-UDA (source-only teacher)",
+        )
 
     # ------------- UDA -------------
     steps_per_epoch = max(1, max(len(src_train_loader), len(tgt_loader)))
@@ -1508,6 +1530,94 @@ def pred_matchprior_covid(probs_source_space: np.ndarray, pi_target_source_space
     return (score_true >= thr).astype(int)
 
 
+# ====================== NEW: Pre-UDA evaluation helper =======================
+
+@torch.no_grad()
+def evaluate_covid_before_uda(
+    teacher: EncoderClassifier,
+    vocab: Vocab,
+    texts: Sequence[str],
+    y_true: Optional[np.ndarray],
+    args: argparse.Namespace,
+    device: torch.device,
+    calib_T: float,
+    p_ema: np.ndarray,
+    pi_target: np.ndarray,
+    stage: str = "Pre-UDA",
+) -> None:
+    """
+    Evaluate the teacher (source-only, before UDA) on the COVID dataset.
+
+    - teacher outputs are in source label space: 0=true, 1=false
+    - COVID eval label space in this script: 1=true, 0=false
+      => use pred_argmax_covid / pred_matchprior_covid
+
+    This evaluation does NOT update any training state (no p_ema update, no pi_target update).
+    """
+    if texts is None or len(texts) == 0:
+        print(f"[Pre-UDA Eval] Skipped ({stage}): empty target eval texts.")
+        return
+
+    infer_ds = InferenceDataset(texts, vocab, args.max_len, args.max_char_len)
+    infer_loader = DataLoader(
+        infer_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=partial(
+            collate_infer,
+            pad_word=vocab.pad_id,
+            pad_char=CHAR_PAD,
+            max_len=args.max_len,
+            max_char_len=args.max_char_len,
+        ),
+        drop_last=False,
+    )
+
+    teacher.eval()
+    probs = np.zeros((len(infer_ds), 2), dtype=np.float32)
+    T_total = max(1e-6, float(calib_T) * float(args.teacher_temp))
+
+    for w_ids, w_mask, c_ids, c_mask, idxs in tqdm(infer_loader, desc=f"Inference ({stage})", leave=False):
+        w_ids, w_mask = w_ids.to(device), w_mask.to(device)
+        c_ids, c_mask = c_ids.to(device), c_mask.to(device)
+        _f, logits = teacher(w_ids, w_mask, c_ids, c_mask)
+        p = torch.softmax(logits / T_total, dim=-1).detach().cpu().numpy()
+        probs[idxs.numpy()] = p
+
+    probs_adj = distribution_align_np(probs, p_ema, pi_target) if args.use_da else probs
+    pred_argmax = pred_argmax_covid(probs_adj)
+    pred_match = pred_matchprior_covid(probs_adj, pi_target)
+
+    print("\n" + "=" * 80)
+    print(f"[Pre-UDA Eval] Stage: {stage}")
+    print(f"[Pre-UDA Eval] N={len(infer_ds)} | DA={'ON' if args.use_da else 'OFF'}")
+    print(f"[Pre-UDA Eval] pi_target(source-space)=[{pi_target[0]:.4f},{pi_target[1]:.4f}]  "
+          f"p_ema=[{p_ema[0]:.4f},{p_ema[1]:.4f}]  calib_T={calib_T:.4f}  teacher_temp={args.teacher_temp:.4f}")
+    print(f"[Pre-UDA Eval] Pred dist argmax (covid 0=false,1=true): {np.bincount(pred_argmax, minlength=2).tolist()}")
+    print(f"[Pre-UDA Eval] Pred dist matchprior (covid 0=false,1=true): {np.bincount(pred_match, minlength=2).tolist()}")
+
+    if y_true is None:
+        print("[Pre-UDA Eval] No ground-truth y provided -> only printed prediction distributions.")
+        print("=" * 80 + "\n")
+        return
+
+    y = np.asarray(y_true, dtype=np.int64)
+    if len(y) != len(infer_ds):
+        print(f"[Pre-UDA Eval] Warning: y_true length {len(y)} != N {len(infer_ds)}. Skip accuracy report.")
+        print("=" * 80 + "\n")
+        return
+
+    for name, pred in [("argmax", pred_argmax), ("matchprior", pred_match)]:
+        acc = accuracy_score(y, pred)
+        cm = confusion_matrix(y, pred, labels=[0, 1])
+        print(f"\n[Pre-UDA Eval:{name}] acc={acc:.6f}")
+        print(cm)
+        print(classification_report(y, pred, digits=4))
+
+    print("=" * 80 + "\n")
+
+
 # ----------------------------- Main ------------------------------------------
 
 
@@ -1710,6 +1820,9 @@ def main() -> None:
         src_val_y=src_val_y if src_val_y else None,
         tgt_texts=tgt_train_unique,
         args=args,
+        # NEW: pass test set for pre-UDA evaluation (accuracy printed before UDA starts)
+        tgt_eval_texts=tgt_test_texts,
+        tgt_eval_y=y_test if (eval_available and y_test is not None) else None,
     )
 
     # inference on test set

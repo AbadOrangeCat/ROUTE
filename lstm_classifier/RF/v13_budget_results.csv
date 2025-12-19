@@ -1,0 +1,12 @@
+﻿seed,budget_raw,budget_used,acc,f1,delta_acc_vs_b0,model_dir
+42,0,0,0.5784960422163589,0.6207715133531158,0.0,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\source_ckpt_seed42
+42,10,10,0.5784960422163589,0.6207715133531158,0.0,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_10_seed42
+42,20,20,0.5784960422163589,0.6207715133531158,0.0,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_20_seed42
+42,50,50,0.6569920844327177,0.7117516629711752,0.07849604221635886,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_50_seed42
+42,100,100,0.9920844327176781,0.9920739762219287,0.41358839050131924,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_100_seed42
+42,200,200,0.996042216358839,0.9960474308300395,0.4175461741424802,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_200_seed42
+42,500,500,0.9986807387862797,0.9986807387862797,0.42018469656992086,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_500_seed42
+42,1000,1000,0.9973614775725593,0.9973544973544973,0.41886543535620047,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_1000_seed42
+42,2000,2000,0.9986807387862797,0.9986807387862797,0.42018469656992086,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_2000_seed42
+42,4000,4000,0.9980211081794196,0.998019801980198,0.4195250659630607,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_4000_seed42
+42,-1,5805,0.9986807387862797,0.9986807387862797,0.42018469656992086,E:\TransferLearning\lstm_classifier\RF\v13_sup_runs\budget_-1_seed42

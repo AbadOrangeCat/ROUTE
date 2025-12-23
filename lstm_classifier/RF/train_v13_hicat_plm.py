@@ -603,7 +603,10 @@ def main():
     seeds = parse_int_list(args.seeds)
     budgets = parse_int_list(args.budgets)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    use_mps = torch.backends.mps.is_available()
+    device = torch.device("mps" if use_mps and not args.cpu else "cpu")
+    print("mps_available=", use_mps, "device=", device)
+
     print(f"[V13] device={device}")
     print(f"[V13] seeds={seeds}")
     print(f"[V13] budgets={budgets} (-1 means full)")

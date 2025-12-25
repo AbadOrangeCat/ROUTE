@@ -67,7 +67,7 @@ MODEL_NAME = "bert-base-uncased"
 TEXT_COL = "text"
 LABEL_COL = "label"
 SOURCE_DIR = "sourcedata"
-TARGET_DIR = "targetdata"
+TARGET_DIR = "targetdata_clean"
 
 # training hyperparams (MPS friendly)
 MAX_LEN = 384

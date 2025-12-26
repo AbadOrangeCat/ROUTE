@@ -59,10 +59,10 @@ MODEL_NAME = "bert-base-uncased"
 SEEDS: List[int] = [13]
 
 RUN_SUITES = {
-    "base": True,
-    "open_set": True,
+    "base": False,
+    "open_set": False,
     "label_shift": True,
-    "combined": True,
+    "combined": False,
 }
 
 # Open-set noise levels (alpha) for mixing politics.csv into target unlabeled.

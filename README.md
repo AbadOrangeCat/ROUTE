@@ -2,6 +2,7 @@
 
 A **reliability-first, label-free** way to adapt fake news detectors when the topic suddenly changes.
 
+**Main entrypoint:** `ROUTE_multidata.py`
 ---
 
 ## What this repository is about
@@ -115,11 +116,13 @@ A typical layout looks like this:
 ```text
 repo_root/
   ROUTE_multidata.py
+  clearndata.py                # optional: offline split cleaning for CSV targetdata
+  checkrepeat.py               # optional: verify overlaps after cleaning
   sourcedata/
     source_train.csv
     source_validation.csv
     source_test.csv
-  targetdata/
+  targetdata/                  # output created by clearndata.py
     train.csv
     val.csv
     test.csv
@@ -172,7 +175,7 @@ This repository supports two evaluation styles:
 
 1. A simple CSV-based “source vs target” task (useful for medical → COVID-19 style transfers)
 2. The Amazon reviews benchmark (12 cross-category transfers)
-
+#### Optional: offline split cleaning utilities (clearndata.py / checkrepeat.py)
 The next two subsections explain each format.
 
 ---
@@ -252,6 +255,9 @@ Then run:
 ```bash
 python ROUTE_multidata.py
 ```
+By default (with `acl_mode="all_pairs"` and 4 ACL domains), it will run:
+`csv_default` (1 task)
+and all 12 cross-category ACL transfers (4×3 = 12 tasks)
 
 By default, outputs go to a folder like:
 

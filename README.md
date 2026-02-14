@@ -250,7 +250,7 @@ Before running, open the `Config` dataclass inside the script to confirm:
 Then run:
 
 ```bash
-python <main_entry_script>.py
+python ROUTE_multidata.py
 ```
 
 By default, outputs go to a folder like:

@@ -20,7 +20,7 @@ ROUTE adapts a text classifier to a new domain **without using any labeled examp
 
 ---
 
-## The main idea in plain language
+## The main idea
 
 Before we go into setup and commands, here is the core story in one minute:
 

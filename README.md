@@ -22,7 +22,7 @@ ROUTE adapts a text classifier to a new domain **without using any labeled examp
 
 ## The main idea
 
-Before we go into setup and commands, here is the core story in one minute:
+Before we go into setup and commands, here is the core story:
 
 1. You have a classifier trained on an old topic (the **source domain**) where labels exist.
 2. A new topic appears (the **target domain**), but you do not have labels yet.
@@ -114,7 +114,7 @@ A typical layout looks like this:
 
 ```text
 repo_root/
-  <main_entry_script>.py
+  ROUTE_multidata.py
   sourcedata/
     source_train.csv
     source_validation.csv
@@ -126,7 +126,7 @@ repo_root/
   processed_acl/
     books/
       positive.review
-      negative.review   (or negatiev.review in some releases)
+      negative.review 
       unlabeled.review
     dvd/
       ...

@@ -1,0 +1,24 @@
+name: routeb-ultra
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+
+  # core deps used in your code
+  - numpy
+  - pandas
+
+  # torch (CPU) for GitHub Actions runners
+  - pytorch
+  - cpuonly
+
+  # dev/test tools used by the workflow
+  - flake8
+  - pytest
+
+  # transformers is easiest via pip (keeps conda solve simpler)
+  - pip:
+      - transformers>=4.30
+      - sentencepiece

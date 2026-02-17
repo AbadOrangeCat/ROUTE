@@ -372,6 +372,6 @@ For a new dataset, you have two options:
   It is useful for experiments, ablations, and reproducibility. Production deployments need additional monitoring, logging, and human oversight.
 
 
-  ## License
+## License
 This project is licensed under the MIT License - see the LICENSE file for details.
 
